@@ -1,99 +1,145 @@
-require_relative 'base_codex'
-require 'open3'
-require 'fileutils'
+# frozen_string_literal: true
 
+require_relative 'base_codex'
+require 'fileutils'
+require 'shellwords'
+require 'time'
+
+# AiderCodex: Specialized adapter for the Aider CLI tool.
+# Handles local file manipulation and token/cost parsing from CLI output.
 class AiderCodex < BaseCodex
   def initialize(config = {})
     super('aider', config || {})
-    @model = config[:model] || config['model'] || 'gemini/gemini-2.5-pro'
     
-    # API Anahtarı Yönetimi
-    raw_key = config[:gemini_api_key] || config['gemini_api_key']
-    if raw_key == "${GOOGLE_API_KEY}"
-      @api_key = ENV['GOOGLE_API_KEY']
-    else
-      @api_key = raw_key || ENV['GEMINI_API_KEY'] || ENV['GOOGLE_API_KEY']
-    end
+    # Configuration-driven CLI Metadata
+    @model       = presence(config[:model])
+    @python_bin  = presence(config[:python_bin]) || 'python3'
+    @edit_format = presence(config[:edit_format]) || 'whole'
+    
+    # API Key Management (Priority: YAML -> ENV)
+    @api_key = presence(config[:gemini_api_key]) || ENV['GOOGLE_API_KEY']
+    @api_key = ENV['GOOGLE_API_KEY'] if @api_key == "${GOOGLE_API_KEY}"
+
+    validate_config!
+  end
+
+  def version
+    # Utilizing centralized run_cmd for version checking
+    result = run_cmd("#{@python_bin} -m aider --version")
+    result[:success] ? result[:stdout].strip : 'not installed'
+  rescue StandardError
+    'not installed'
   end
 
   def warmup(dir)
-    puts "  [Aider] Isınma turu yapılıyor... Model: #{@model}"
-    run_generation("Respond with 'OK'. Do not write any code.", dir: dir)
+    puts "  Warmup: Validating Aider CLI (Model: #{@model})..."
+    run_generation("Respond with 'OK'.", dir: dir)
   end
 
   def run_generation(prompt, dir:, log_path: nil)
     start_time = Time.now
+    # Prepare target files (Aider requires at least one file to operate)
+    file_names = ensure_target_files(dir)
     
-    # Dosyaları hazırla
-    target_files = Dir.glob(File.join(dir, '*')).select { |f| File.file?(f) }
-    if target_files.empty?
-      fallback_file = File.join(dir, "main.py")
-      File.write(fallback_file, "# Benchmark Entry Point\n")
-      target_files = [fallback_file]
+    begin
+      # Command and Environment preparation
+      cmd = build_aider_command(prompt, file_names)
+      env = { 'GEMINI_API_KEY' => @api_key.to_s, 'PYTHONIOENCODING' => 'utf-8' }
+
+      # Execution via centralized BaseCodex logic
+      result = run_cmd(cmd, dir: dir, env: env)
+      elapsed = Time.now - start_time
+      metrics = parse_metrics(result[:stdout])
+
+      log_execution(log_path, prompt, result) if log_path
+
+      # Aider updates files directly, but we still attempt code extraction 
+      # for BaseCodex compliance (optional fallback)
+      save_generated_code(result[:stdout], dir)
+
+      {
+        success: result[:success],
+        elapsed_seconds: elapsed.round(1),
+        metrics: metrics,
+        stdout: result[:stdout],
+        stderr: result[:stderr]
+      }
+    rescue StandardError => e
+      handle_error(e, start_time)
     end
-    file_names = target_files.map { |f| File.basename(f) }
-
-    # Komut dizisi
-    cmd = [
-      "py", "-3.12", "-m", "aider",
-      "--no-git", "--yes", "--no-show-model-warnings",
-      "--edit-format", "whole",
-      "--model", @model,
-      "--message", prompt + "\n\nCRITICAL: Write COMPLETE code in the files: #{file_names.join(', ')}"
-    ] + file_names
-    
-    env = { 
-      "GEMINI_API_KEY" => @api_key,
-      "PYTHONIOENCODING" => "utf-8" 
-    }
-
-    # --- KRİTİK DEĞİŞİKLİK: capture3 kullanarak sessizce çalıştır ---
-    stdout, stderr, status = Open3.capture3(env, *cmd, chdir: dir)
-
-    # Logları diske yaz (PR artifactları için gerekli)
-    if log_path
-      FileUtils.mkdir_p(File.dirname(log_path))
-      File.write(log_path, stdout)
-      File.write(log_path + ".err", stderr) unless stderr.strip.empty?
-    end
-
-    {
-      stdout: stdout,
-      stderr: stderr,
-      success: status.success?,
-      elapsed_seconds: (Time.now - start_time).round(1),
-      metrics: parse_metrics(stdout)
-    }
-  end
-
-  def version
-    `py -3.12 -m aider --version`.strip
-  rescue
-    "not installed"
   end
 
   private
 
+  def build_aider_command(prompt, files)
+    # Flags to reduce Aider verbosity and focus on the benchmark task
+    base_args = [
+      *@python_bin.split, '-m', 'aider',
+      '--no-git',              # Prevent tainting benchmark directory with git
+      '--yes',                 # Skip confirmation prompts
+      '--no-show-model-warnings',
+      '--edit-format', @edit_format,
+      '--model', @model,
+      '--message', "#{prompt}\n\nCRITICAL: Write COMPLETE code for: #{files.join(', ')}"
+    ]
+    Shellwords.join(base_args + files)
+  end
+
   def parse_metrics(stdout)
-    input = 0; output = 0; cost = 0.0
-    
-    # Gelişmiş Regex: '3.0k' gibi değerleri ve virgülleri yakalar
-    # Örn: "Tokens: 3.0k sent, 1.3k received. Cost: $0.02"
+    input, output, cost = 0, 0, 0.0
+    # Captures Aider's terminal output: "Tokens: 1.2k sent, 300 received. Cost: $0.01"
     stdout.scan(/Tokens:\s*([\d.k,]+)\s*sent,\s*([\d.k,]+)\s*received\.\s*Cost:\s*\$([\d.]+)/i) do |s, r, c|
-      input += parse_aider_number(s)
+      input  += parse_aider_number(s)
       output += parse_aider_number(r)
-      cost += c.to_f
+      cost   += c.to_f
     end
 
-    { input_tokens: input, output_tokens: output, total_cost: cost.round(4) }
+    {
+      input_tokens: input,
+      output_tokens: output,
+      cost_usd: cost.round(6),
+      model: @model
+    }
   end
 
   def parse_aider_number(str)
     num_str = str.delete(',').downcase
-    if num_str.include?('k')
-      (num_str.to_f * 1000).to_i
-    else
-      num_str.to_i
+    num_str.include?('k') ? (num_str.to_f * 1000).to_i : num_str.to_i
+  end
+
+  def log_execution(path, prompt, result)
+    FileUtils.mkdir_p(File.dirname(path))
+    log_data = {
+      model: @model,
+      prompt: prompt,
+      success: result[:success],
+      stdout: result[:stdout],
+      stderr: result[:stderr],
+      timestamp: Time.now.iso8601
+    }
+    File.write(path, JSON.pretty_generate(log_data))
+  end
+
+  def handle_error(e, start_time)
+    puts "\n" + ("!" * 50)
+    puts "❌ AIDER ADAPTER ERROR: #{e.message}"
+    puts ("!" * 50) + "\n"
+    { success: false, elapsed_seconds: (Time.now - start_time).round(1), error: e.message }
+  end
+
+  def ensure_target_files(dir)
+    targets = Dir.glob(File.join(dir, '*')).select { |f| File.file?(f) }
+    if targets.empty?
+      # If empty, create a dummy file for Aider to work on
+      fallback = File.join(dir, 'main.c') # Targeted for C-focused benchmarks
+      File.write(fallback, "// Generated by Benchmark\n")
+      targets = [fallback]
     end
+    targets.map { |f| File.basename(f) }
+  end
+
+  def validate_config!
+    raise CodexError, 'Aider requires GEMINI_API_KEY/GOOGLE_API_KEY' unless @api_key
+    raise CodexError, 'Aider Model name not configured' unless @model
   end
 end
