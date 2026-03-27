@@ -164,5 +164,10 @@ Message: <message>
 - Exact string matching required
 
 ========================================
+6. Error Handling
+========================================
+- Invalid input: If the user inputs only numbers or special characters instead of a valid text, the program should print "Error: Please enter a valid text."
+
+========================================
 END
 ========================================
